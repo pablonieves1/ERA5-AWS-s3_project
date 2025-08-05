@@ -6,24 +6,19 @@ good: NETCDF3_64BIT_OFFSET
 test: NETCDF3_64BIT_OFFSET
 
 === Dimensions ===
-Only in test: ['forecast_hour', 'forecast_initial_time']
 Size differences:
-  latitude: good=19, test=14
-  longitude: good=26, test=18
   time: good=24, test=744
 
 === Coordinates (presence) ===
-Only in test: ['forecast_hour', 'forecast_initial_time']
 
 === Coordinates (detail differences) ===
 - latitude:
-   dtype: ('float32', 'float64')
+   attrs: {'axis': (None, 'Y'), 'standard_name': (None, 'latitude')}
 - longitude:
-   dtype: ('float32', 'float64')
-   attrs: {'units': ('degrees_east', None), 'long_name': ('longitude', None)}
+   attrs: {'axis': (None, 'X'), 'standard_name': (None, 'longitude')}
 
 === Variables (presence) ===
-Only in test: ['fg10', 'u10', 'v10']
+Only in test: ['u10', 'v10']
 
 === Variables (detail differences) ===
 - sp:
@@ -38,7 +33,7 @@ Only in test: ['fg10', 'u10', 'v10']
 
 === Time axis ===
 good encoding: {'units': 'hours since 1900-01-01 00:00:00.0', 'calendar': 'gregorian'}
-test encoding: {'units': 'hours since 1900-01-01', 'calendar': 'standard'}
+test encoding: {'units': 'hours since 1900-01-01', 'calendar': 'gregorian'}
 good first/last: 1995-01-01T00:00:00.000000000  1995-01-01T23:00:00.000000000
 test first/last: 1995-01-01T00:00:00.000000000  1995-01-31T23:00:00.000000000
 good step (h): 1.0

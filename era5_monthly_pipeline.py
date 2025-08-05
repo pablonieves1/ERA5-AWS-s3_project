@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import sys, subprocess, shutil, os, calendar, argparse, json
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +12,7 @@ SRC_BUCKET = "nsf-ncar-era5"
 DST_BUCKET = "pablo-era5-results-usw2"
 
 # Ohio bounding box (decimal degrees)
-OHIO = dict(lat_min=38.4, lat_max=41.9, lon_min=-84.8, lon_max=-80.5)
+OHIO = dict(lat_min=38.0, lat_max=42.5, lon_min=-86.25, lon_max=-80.0)
 
 # Variable specifications:
 #  - cls/pid   : used to build the expected filename pattern (when applicable)
@@ -165,7 +164,6 @@ def collapse_fc_to_time(sub):
     For forecast min/max files (10fg), collapse forecast_initial_time + forecast_hour
     into a single 'time' coordinate (datetime64[ns]). Removes forecast dims/coords.
     """
-    # find coordinate names
     fi = None
     for cand in ("forecast_initial_time", "forecast_reference_time"):
         if cand in sub.coords:
@@ -178,30 +176,30 @@ def collapse_fc_to_time(sub):
             break
 
     if fi and fh and fi in sub.dims and fh in sub.dims:
-        # 1) Get 1-D numpy arrays
-        fi_vals = sub[fi].astype("datetime64[h]").values  # shape: (Nfi,)
-        fh_vals = sub[fh].astype("timedelta64[h]").values # shape: (Nfh,)
+        # 1) Extract raw numpy arrays to avoid xarray constructing DataArrays (silences warnings)
+        fi_vals_h = sub[fi].values.astype("datetime64[h]")     # shape: (Nfi,)
+        fh_vals_h = sub[fh].values.astype("timedelta64[h]")    # shape: (Nfh,)
 
         # 2) Broadcast to 2-D grid and convert to ns precision
-        #    (Nfi, Nfh) datetime64[h] + timedelta64[h] -> datetime64[h] -> [ns]
-        time2d_h = fi_vals[:, None] + fh_vals[None, :]
-        time2d = time2d_h.astype("datetime64[ns]")
+        time2d_h = fi_vals_h[:, None] + fh_vals_h[None, :]     # (Nfi, Nfh) in hours
+        time2d = time2d_h.astype("datetime64[ns]")             # ns precision for xarray
 
-        # 3) Attach as a 2-D coord with dims (fi, fh)
+        # 3) Attach as 2-D coord with dims (fi, fh)
         sub = sub.assign_coords({"time": ((fi, fh), time2d)})
 
-        # 4) Stack the two forecast dims into a single 'time' dim
-        sub = sub.stack(time=(fi, fh))
+        # 4) Stack to a single 'time' dim and drop MultiIndex cleanly
+        sub = sub.stack(time=(fi, fh)).reset_index("time")
 
-        # 5) Sort by time and drop duplicated timestamps (keep first)
+        # 5) Sort and drop duplicate timestamps
         sub = sub.sortby("time")
-        uniq_vals, uniq_idx = np.unique(sub["time"].values, return_index=True)
+        _, uniq_idx = np.unique(sub["time"].values, return_index=True)
         sub = sub.isel(time=np.sort(uniq_idx))
 
-        # 6) Remove leftover forecast dims/coords
+        # 6) Remove leftover forecast coords/dims
         sub = sub.drop_vars([fi, fh], errors="ignore").drop_dims([fi, fh], errors="ignore")
 
     return sub
+
 
 
 # ----------------- Per-month processing -----------------
@@ -230,7 +228,9 @@ def process_month(year: int, month: int, vars_list: List[str], work_root: Path, 
         if verbose:
             print(f"[SRC] {var} → {len(keys)} file(s) in {yyyymm}")
 
-        sub_pieces = []
+
+        pieces_da: List[xr.DataArray] = []
+        pieces_ds: List[xr.Dataset] = []
         time_name_common: Optional[str] = None
 
         for key in keys:
@@ -243,41 +243,96 @@ def process_month(year: int, month: int, vars_list: List[str], work_root: Path, 
                 local_nc, OHIO["lon_min"], OHIO["lon_max"], OHIO["lat_min"], OHIO["lat_max"]
             )
 
-            # Pick main var and rename to canonical
+
             main = pick_main_var(sub)
             sub = sub[[main]]
             if main != canon:
                 sub = sub.rename({main: canon})
 
-            # If this is gust (forecast min/max), collapse forecast dims into 'time'
             if var == "10fg":
+
                 sub = collapse_fc_to_time(sub)
-                time_name = "time" if "time" in sub.coords else time_name
+                if "time" in sub.coords:
+                    sub = sub.sel(time=slice(start_iso, end_iso))
+                    pieces_da.append(sub[canon])
+                    if not time_name_common:
+                        time_name_common = "time"
+                else:
+                    if verbose: print("[WARN] 10fg piece without time after collapse; skipping")
+            else:
 
-            # Strictly clip to the month time window
-            if time_name and time_name in sub.coords:
-                sub = sub.sel({time_name: slice(start_iso, end_iso)})
+                if time_name and time_name in sub.coords:
+                    sub = sub.sel({time_name: slice(start_iso, end_iso)})
+                    if not time_name_common:
+                        time_name_common = time_name
+                pieces_ds.append(sub)
 
-            sub_pieces.append(sub)
-            if time_name and not time_name_common:
-                time_name_common = time_name
-
-            # close & free disk
+            # Close an dclean
             try: ds.close()
             except Exception: pass
             try: local_nc.unlink()
             except Exception: pass
 
-        # Concatenate chunks along time (or merge if no time)
-        if len(sub_pieces) == 1:
-            sub_all = sub_pieces[0]
-        else:
-            if time_name_common and (time_name_common in sub_pieces[0].coords):
-                sub_all = xr.concat(sub_pieces, dim=time_name_common).sortby(time_name_common)
+        # Debug longitudes
+        if verbose and time_name_common:
+            if var == "10fg":
+                lens = [p.sizes.get("time", 0) for p in pieces_da]
             else:
-                sub_all = xr.merge(sub_pieces)
+                lens = [p.sizes.get(time_name_common, 0) for p in pieces_ds if time_name_common in p.sizes]
+            print(f"[{var}] piece lengths before concat: {lens}")
 
-        # Write per-variable subset (temporary). Keep simple intermediate.
+        # Filter pieces after temporal cut
+        if var == "10fg":
+            pieces_da = [p for p in pieces_da if p.sizes.get("time", 0) > 0]
+            if not pieces_da:
+                if verbose: print(f"[WARN] no data for {var} in {yyyymm} after slicing; skipping")
+                continue
+
+            # Concat of DataArrays
+            da_all = xr.concat(
+                pieces_da,
+                dim="time",
+                join="outer",
+                compat="override",
+            ).sortby("time")
+
+            # Deduplicate timestamps
+            tvals = da_all["time"].values
+            _, uniq_idx = np.unique(tvals, return_index=True)
+            da_all = da_all.isel(time=np.sort(uniq_idx))
+            da_all = da_all.sel(time=slice(start_iso, end_iso))
+
+            if verbose:
+                print(f"[{var}] after concat: {da_all.sizes.get('time', 0)}")
+
+            # Return to dataset
+            sub_all = da_all.to_dataset(name=canon)
+
+        else:
+            pieces_ds = [p for p in pieces_ds if (not time_name_common) or (p.sizes.get(time_name_common, 0) > 0)]
+            if not pieces_ds:
+                if verbose: print(f"[WARN] no data for {var} in {yyyymm} after slicing; skipping")
+                continue
+
+            if len(pieces_ds) == 1:
+                sub_all = pieces_ds[0]
+            else:
+                if time_name_common and (time_name_common in pieces_ds[0].coords):
+                    sub_all = xr.concat(
+                        pieces_ds,
+                        dim=time_name_common,
+                        join="outer",
+                        data_vars="minimal",
+                        coords="minimal",
+                        compat="override",
+                    ).sortby(time_name_common)
+                else:
+                    sub_all = xr.merge(pieces_ds)
+
+            if verbose and time_name_common and (time_name_common in sub_all.coords):
+                print(f"[{var}] after concat: {sub_all.sizes.get(time_name_common, 0)}")
+
+        # Write intermediate per variable
         out_subset = ss_dir / f"{canon}_{yyyymm}.nc"
         if verbose: print(f"[WR] {out_subset.name} ({canon})")
         sub_all.to_netcdf(out_subset.as_posix(), engine="netcdf4", format="NETCDF4_CLASSIC", encoding={canon: {}})
@@ -287,12 +342,12 @@ def process_month(year: int, month: int, vars_list: List[str], work_root: Path, 
 
         subset_paths[canon] = out_subset
 
-    # --- MERGE canonical variables ---
+    # MERGE final of canonical variables
     if verbose: print("[MERGE] combining variables")
     dsets = [xr.open_dataset(p.as_posix()) for p in subset_paths.values()]
     merged = xr.merge(dsets, compat="no_conflicts", join="exact")
 
-    # --- Normalize coordinates: names, dtype (float32), attrs ---
+    # Normalize coords and attrs
     coord_map = {}
     if "lat" in merged.coords and "latitude" not in merged.coords:
         coord_map["lat"] = "latitude"
@@ -321,45 +376,38 @@ def process_month(year: int, month: int, vars_list: List[str], work_root: Path, 
             "axis": "X",
         })
 
-    # --- Drop any leftover forecast dims/coords (safety) ---
+    # Clean
     for name in ("forecast_hour","forecast_initial_time","forecast_reference_time","step","lead_time"):
         if name in merged.dims:
             merged = merged.drop_dims(name, errors="ignore")
         if name in merged.coords:
             merged = merged.drop_vars(name, errors="ignore")
 
-    # --- Time encoding exactly like your 'good' file ---
+    # encoding time
     if "time" in merged.coords:
         merged["time"].encoding.update({
             "units": "hours since 1900-01-01 00:00:00.0",
             "calendar": "gregorian",
         })
 
-    # --- Ensure dim order (time, latitude, longitude) when present ---
+    # Order dims
     for v in list(merged.data_vars):
         dims = merged[v].dims
         desired = tuple([d for d in ("time","latitude","longitude") if d in dims])
         if set(dims) == set(desired) and dims != desired:
             merged[v] = merged[v].transpose(*desired)
 
-    # --- (Optional) match some variable dtypes to float64 like your 'good' ---
-    # If you want: uncomment next lines to force float64 for these variables
-    # for v in ("sp","t2m","u100","v100"):
-    #     if v in merged and merged[v].dtype != "float64":
-    #         merged[v] = merged[v].astype("float64")
-
-    # --- Write final monthly file as NetCDF3 (max compatibility) ---
+    # Write monthly netcdf3
     out_local = month_dir / f"ERA5_OH_{yyyymm}.nc"
     merged.to_netcdf(out_local.as_posix(), engine="scipy")
 
-    # close temps
+    # Cloase and clean
     for ds_tmp in dsets:
         try: ds_tmp.close()
         except Exception: pass
     try: merged.close()
     except Exception: pass
 
-    # Upload to S3 and clean local
     dst_key = f"{out_s3_prefix}/{year:04d}/ERA5_OH_{yyyymm}.nc"
     if verbose: print(f"[UP] s3://{DST_BUCKET}/{dst_key}")
     s3_cp(out_local.as_posix(), f"s3://{DST_BUCKET}/{dst_key}")
@@ -370,6 +418,8 @@ def process_month(year: int, month: int, vars_list: List[str], work_root: Path, 
         shutil.rmtree(dl_dir, ignore_errors=True)
     except Exception:
         pass
+
+
 
 # ----------------- CLI -----------------
 
